@@ -2,5 +2,5 @@ streamlit==1.35.0
 pandas==2.2.3
 numpy==1.26.4
 scikit-learn==1.6.1
-tensorflow==2.11.1
+tensorflow-cpu==2.16.2   # <-- replaces the old 2.11.1 line
 scipy==1.15.1
