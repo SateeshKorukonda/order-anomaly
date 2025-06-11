@@ -148,8 +148,8 @@ def main():
             if err:
                 st.error(err)
             else:
-                st.write(f'**Predicted:** {res[\"predicted\"]:.2f}')
-                st.write(f'**P-value:** {res[\"p_value\"]:.4f}')
+                st.write(f'**Predicted:** {res["predicted"]:.2f}')
+                st.write(f'**P-value:** {res["p_value"]:.4f}')
                 st.markdown('### 🚨 **Anomaly!**' if res['anomaly']
                             else '### ✅ All good.')
 
