@@ -1,0 +1,6 @@
+streamlit>=1.35
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+tensorflow>=2.16     # CPU variant is fine
+scipy>=1.13
