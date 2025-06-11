@@ -112,7 +112,8 @@ def main():
     df_raw = pd.read_csv(file)
     required = {'date', 'time', 'client_code', 'order_count'}
     if not required.issubset(df_raw.columns):
-        st.error(f'CSV must contain: {\", \".join(required)}')
+        missing = ", ".join(required)
+        st.error(f'CSV must contain: {missing}')
         st.stop()
 
     client = st.selectbox('Client to model', sorted(df_raw['client_code'].unique()))
