@@ -1,7 +1,6 @@
-# Streamlit UI + data science stack (CPU-only)
 streamlit==1.35.0
 pandas==2.2.2
 numpy==1.26.4
 scikit-learn==1.6.2
-tensorflow-cpu==2.16.2   # matches Python ≤3.11
+tensorflow-cpu==2.16.2
 scipy==1.11.4
