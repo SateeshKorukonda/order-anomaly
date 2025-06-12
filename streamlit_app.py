@@ -10,29 +10,31 @@ from datetime import datetime
 
 """Streamlit ‑ Order‑count anomaly detector
 
-This version is more tolerant of CSV date/time formats:
-• Accepts either a single **timestamp** column **or** separate **date** & **time** columns.
-• Supports both *YYYY‑MM‑DD* and *DD‑MM‑YYYY* (day‑first) layouts, with or without seconds.
-• Gives a clear error listing the first unparsable row if parsing fails.
+Key changes (June 2025)
+-----------------------
+1. **Tolerance slider** – choose how big a drop (fraction of expected) counts as
+   an anomaly. 0.5 → flag anything below 50 % of expected; 0.8 → only large dips.
+2. **Calendar baseline uses median** instead of mean, so a few double‑entries in
+   a 20‑min slot no longer inflate the expectation.
+3. All earlier robustness around timestamp parsing remains.
 """
 
-SEQ_LENGTH = 6   # number of 20‑min intervals (2 h) used as model input
+SEQ_LENGTH = 6   # number of 20‑min intervals (2 h window)
 EPOCHS      = 15
 
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def preprocess(df_raw: pd.DataFrame, client: str) -> pd.DataFrame:
-    """Return a dataframe aggregated to 20‑minute bins with calendar features."""
+    """Aggregate to 20‑minute bins and append calendar features."""
 
-    # ── 1 · Keep only rows for the chosen client (if column present) ─────────
+    # 1 · Filter by client if column present
     if 'client_code' in df_raw.columns:
         df = df_raw[df_raw['client_code'] == client].copy()
     else:
         df = df_raw.copy()
 
-    # ── 2 · Build a timestamp column robustly ────────────────────────────────
+    # 2 · Build a timestamp column robustly
     if 'timestamp' in df.columns:
-        # Accept any reasonable format; try day‑first first
         df['timestamp'] = pd.to_datetime(df['timestamp'], dayfirst=True,
                                          errors='coerce')
     elif {'date', 'time'} <= set(df.columns):
@@ -40,26 +42,24 @@ def preprocess(df_raw: pd.DataFrame, client: str) -> pd.DataFrame:
         df['timestamp'] = pd.to_datetime(combo, dayfirst=True,
                                          errors='coerce')
     else:
-        raise ValueError("CSV must contain either a 'timestamp' column or both 'date' and 'time' columns.")
+        raise ValueError("CSV needs a 'timestamp' column or both 'date' and 'time'.")
 
-    # Show user the first unparsable example, if any
     if df['timestamp'].isna().any():
-        bad = df[df['timestamp'].isna()].head(3)
-        sample = bad.iloc[0].to_dict()
-        raise ValueError(f"Could not parse some date/time values, e.g. {sample} . Please ensure a consistent format.")
+        samp = df[df['timestamp'].isna()].iloc[0].to_dict()
+        raise ValueError(f"Could not parse date/time for row like: {samp}")
 
     df.set_index('timestamp', inplace=True)
 
-    # ── 3 · Ensure order_count numeric ───────────────────────────────────────
+    # 3 · Ensure order_count numeric
     df['order_count'] = pd.to_numeric(df['order_count'], errors='coerce').fillna(0)
 
-    # ── 4 · Aggregate to 20‑minute bins ──────────────────────────────────────
+    # 4 · Aggregate to 20‑min bins – **sum** is still correct for volume
     df_agg = (df['order_count']
               .resample('20min').sum()
               .reset_index()
               .rename(columns={'timestamp': 'interval_20min'}))
 
-    # ── 5 · Calendar features ───────────────────────────────────────────────
+    # 5 · Calendar features
     df_agg['hour']        = df_agg['interval_20min'].dt.hour
     df_agg['minute']      = df_agg['interval_20min'].dt.minute
     df_agg['day_of_week'] = df_agg['interval_20min'].dt.dayofweek
@@ -71,7 +71,7 @@ def preprocess(df_raw: pd.DataFrame, client: str) -> pd.DataFrame:
 def create_supervised(df: pd.DataFrame,
                       feats=('order_count', 'hour', 'minute', 'day_of_week'),
                       n: int = SEQ_LENGTH):
-    """Convert a time‑series frame to (X, y) supervised samples."""
+    """Convert a df into (X, y) for sequence‑to‑one forecasting."""
     X, y = [], []
     for i in range(len(df) - n):
         X.append(df[feats].iloc[i:i + n].values)
@@ -96,7 +96,6 @@ def train_model(df: pd.DataFrame):
     feats = ['order_count', 'hour', 'minute', 'day_of_week']
     X, y = create_supervised(df, feats, SEQ_LENGTH)
 
-    # Two separate scalers: inputs & target
     sx = MinMaxScaler()
     X_scaled = sx.fit_transform(X.reshape(-1, len(feats))).reshape(X.shape)
 
@@ -116,53 +115,46 @@ def train_model(df: pd.DataFrame):
 
 def detect_anomaly(history: pd.DataFrame,
                    model, sx, sy,
-                   ts: datetime, order_cnt: int):
-    """Detect anomaly for *ts/order_cnt*.
+                   ts: datetime, order_cnt: int,
+                   drop_threshold: float = 0.5):
+    """Return diagnostics dict or (None, error_msg)."""
 
-    Two modes:
-    1. **Sequence‑based forecast** – when *ts* is within four hours of the last
-       timestamp in *history*. Uses the LSTM forecaster trained on the most
-       recent two hours of data.
-    2. **Calendar baseline** – when *ts* lies farther in the future wrt the
-       training data. Computes the historical mean for the same day‑of‑week
-       and 20‑min slot and uses that as the expected value.
-    """
     ts_floor = pd.to_datetime(ts).floor('20min')
     h_max    = history['interval_20min'].max()
+    feats    = ['order_count', 'hour', 'minute', 'day_of_week']
+    actual   = order_cnt
 
-    feats = ['order_count', 'hour', 'minute', 'day_of_week']
-    actual = order_cnt
-
-    # ── Mode choice ─────────────────────────────────────────────────────────
+    # ── Mode switch ──────────────────────────────────────────────────────────
     if (ts_floor - h_max) <= pd.Timedelta(hours=4):
-        # ── 1 · Sequence‑based forecast ────────────────────────────────────
+        # Recent → use LSTM forecast
         past = history[history['interval_20min'] < ts_floor].tail(SEQ_LENGTH)
         if len(past) < SEQ_LENGTH:
-            return None, (f'Need ≥ {SEQ_LENGTH} prior intervals for {ts_floor} prediction.')
-
-        X  = past[feats].values
-        Xs = sx.transform(X).reshape(1, SEQ_LENGTH, len(feats))
+            return None, 'Not enough history for sequence forecast.'
+        Xs = sx.transform(past[feats].values)
+        Xs = Xs.reshape(1, SEQ_LENGTH, len(feats))
         pred_scaled = model.predict(Xs, verbose=0)[0, 0]
         expected    = sy.inverse_transform([[pred_scaled]])[0, 0]
+        mode        = 'sequence'
     else:
-        # ── 2 · Calendar baseline (same DOW & clock) ───────────────────────
-        cal_mask = (
+        # Far future → calendar median baseline
+        mask = (
             (history['hour']   == ts_floor.hour) &
             (history['minute'] == ts_floor.minute) &
             (history['day_of_week'] == ts_floor.dayofweek)
         )
-        subset = history[cal_mask]
+        subset = history[mask]
         if subset.empty:
-            return None, ('No historical data for this day‑of‑week/time‑of‑day slot.')
-        expected = subset['order_count'].mean()
+            return None, 'No history for this weekday/time slot.'
+        expected = subset['order_count'].median()  # ← changed to median
+        mode     = 'calendar'
 
-        # ── Statistical tests ─────────────────────────────────────────────────
-    p_val       = poisson.cdf(actual, max(expected, 1e-6))  # avoid μ=0
-    ratio_flag  = (actual + 1e-9) / (expected + 1e-9) < 0.5
+    expected = max(expected, 1e-6)  # safety against zero
+
+    # ── Statistical tests ───────────────────────────────────────────────────
+    p_val       = poisson.cdf(actual, expected)
+    ratio_flag  = (actual / expected) < drop_threshold
     poisson_flag = p_val < 0.001
-
-    # Strict but robust: flag if the drop is both statistically rare *and* a ≥50 % fall
-    anomaly = poisson_flag and ratio_flag
+    anomaly     = ratio_flag and poisson_flag
 
     return {
         'timestamp': ts_floor,
@@ -170,7 +162,8 @@ def detect_anomaly(history: pd.DataFrame,
         'expected': expected,
         'p_value': p_val,
         'anomaly': anomaly,
-        'mode': 'sequence' if (ts_floor - h_max) <= pd.Timedelta(hours=4) else 'calendar'
+        'mode': mode,
+        'drop_threshold': drop_threshold,
     }, None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,19 +177,15 @@ def main():
         st.stop()
 
     df_raw = pd.read_csv(file)
-
     if 'order_count' not in df_raw.columns:
-        st.error("CSV must contain an 'order_count' column.")
+        st.error("CSV must include an 'order_count' column.")
         st.stop()
 
-    # If no client_code, treat whole file as one client
     if 'client_code' not in df_raw.columns:
         df_raw['client_code'] = 'ALL'
 
-    client = st.selectbox('Client to model',
-                          sorted(df_raw['client_code'].unique()))
+    client = st.selectbox('Client to model', sorted(df_raw['client_code'].unique()))
 
-    # Pre‑processing can raise ValueError – catch & show
     try:
         df_client = preprocess(df_raw, client)
     except ValueError as e:
@@ -206,7 +195,7 @@ def main():
     st.write(f'Aggregated rows: **{len(df_client)}**')
 
     if len(df_client) < SEQ_LENGTH + 1:
-        st.error(f'Need ≥ {SEQ_LENGTH + 1} rows after aggregation for training.')
+        st.error(f'Need at least {SEQ_LENGTH + 1} rows after aggregation.')
         st.stop()
 
     if st.button('🔄 Train / Retrain model'):
@@ -215,32 +204,36 @@ def main():
         st.session_state.update(model=model, sx=sx, sy=sy, history=df_client)
         st.success('Model trained! Enter a test point below.')
 
+    # ── Detection UI ─────────────────────────────────────────────────────────
     if {'model', 'sx', 'sy', 'history'} <= st.session_state.keys():
         st.subheader('🔍 Check a new data point')
         col1, col2 = st.columns(2)
         with col1:
-            ts_str = st.text_input('Timestamp (YYYY‑MM‑DD HH:MM)',
+            ts_str = st.text_input('Timestamp (YYYY-MM-DD HH:MM)',
                                    value=datetime.now().strftime('%Y-%m-%d %H:%M'))
         with col2:
             cnt = st.number_input('Order count', min_value=0, value=0)
+
+        drop_threshold = st.slider('Tolerance – flag if actual is below this fraction of expected',
+                                   min_value=0.1, max_value=1.0, value=0.5, step=0.05)
 
         if st.button('Detect'):
             try:
                 ts = pd.to_datetime(ts_str, dayfirst=False, errors='raise')
             except ValueError:
-                st.error('Invalid timestamp format; use YYYY‑MM‑DD HH:MM')
+                st.error('Invalid timestamp format. Use YYYY-MM-DD HH:MM')
                 st.stop()
 
             res, err = detect_anomaly(st.session_state['history'],
                                       st.session_state['model'],
                                       st.session_state['sx'],
                                       st.session_state['sy'],
-                                      ts, int(cnt))
+                                      ts, int(cnt), drop_threshold)
             if err:
                 st.error(err)
             else:
-                st.write(f"**Predicted (expected):** {res['expected']:.2f}")
-                st.write(f"**P‑value:** {res['p_value']:.4g}")
+                st.write(f"**Expected:** {res['expected']:.2f} (mode: {res['mode']})")
+                st.write(f"**P-value:** {res['p_value']:.3g}")
                 st.write(f"**Anomaly:** {res['anomaly']}")
                 st.markdown('### 🚨 **Anomaly!**' if res['anomaly'] else '### ✅ Normal behaviour')
     else:
