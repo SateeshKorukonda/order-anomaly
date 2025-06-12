@@ -3,102 +3,143 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from scipy.stats import poisson
 from datetime import datetime
 
-SEQ_LENGTH = 6          # 6 × 20‑min = 2 h window
-EPOCHS = 15
+"""Streamlit ‑ Order‑count anomaly detector
 
-# -------------------------------------------------
+This version is more tolerant of CSV date/time formats:
+• Accepts either a single **timestamp** column **or** separate **date** & **time** columns.
+• Supports both *YYYY‑MM‑DD* and *DD‑MM‑YYYY* (day‑first) layouts, with or without seconds.
+• Gives a clear error listing the first unparsable row if parsing fails.
+"""
+
+SEQ_LENGTH = 6   # number of 20‑min intervals (2 h) used as model input
+EPOCHS      = 15
+
+# ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def preprocess(df_raw: pd.DataFrame, client: str) -> pd.DataFrame:
-    """Filter for one client & aggregate to 20‑min bins."""
-    df = df_raw[df_raw['client_code'] == client].copy()
-    # Combine date & time columns to datetime
-    df['timestamp'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+    """Return a dataframe aggregated to 20‑minute bins with calendar features."""
+
+    # ── 1 · Keep only rows for the chosen client (if column present) ─────────
+    if 'client_code' in df_raw.columns:
+        df = df_raw[df_raw['client_code'] == client].copy()
+    else:
+        df = df_raw.copy()
+
+    # ── 2 · Build a timestamp column robustly ────────────────────────────────
+    if 'timestamp' in df.columns:
+        # Accept any reasonable format; try day‑first first
+        df['timestamp'] = pd.to_datetime(df['timestamp'], dayfirst=True,
+                                         errors='coerce')
+    elif {'date', 'time'} <= set(df.columns):
+        combo = df['date'].astype(str) + ' ' + df['time'].astype(str)
+        df['timestamp'] = pd.to_datetime(combo, dayfirst=True,
+                                         errors='coerce')
+    else:
+        raise ValueError("CSV must contain either a 'timestamp' column or both 'date' and 'time' columns.")
+
+    # Show user the first unparsable example, if any
+    if df['timestamp'].isna().any():
+        bad = df[df['timestamp'].isna()].head(3)
+        sample = bad.iloc[0].to_dict()
+        raise ValueError(f"Could not parse some date/time values, e.g. {sample} . Please ensure a consistent format.")
+
     df.set_index('timestamp', inplace=True)
 
-    # 20‑minute resample
-    df_agg = (df
-              .resample('20min')['order_count']
-              .sum()
-              .rename('order_count')
-              .reset_index())
+    # ── 3 · Ensure order_count numeric ───────────────────────────────────────
+    df['order_count'] = pd.to_numeric(df['order_count'], errors='coerce').fillna(0)
 
-    # Calendar features
-    df_agg['hour'] = df_agg['timestamp'].dt.hour
-    df_agg['minute'] = df_agg['timestamp'].dt.minute
-    df_agg['day_of_week'] = df_agg['timestamp'].dt.dayofweek
-    df_agg.rename(columns={'timestamp': 'interval_20min'}, inplace=True)
+    # ── 4 · Aggregate to 20‑minute bins ──────────────────────────────────────
+    df_agg = (df['order_count']
+              .resample('20min').sum()
+              .reset_index()
+              .rename(columns={'timestamp': 'interval_20min'}))
+
+    # ── 5 · Calendar features ───────────────────────────────────────────────
+    df_agg['hour']        = df_agg['interval_20min'].dt.hour
+    df_agg['minute']      = df_agg['interval_20min'].dt.minute
+    df_agg['day_of_week'] = df_agg['interval_20min'].dt.dayofweek
+
     return df_agg.sort_values('interval_20min')
 
-# -------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+
 def create_supervised(df: pd.DataFrame,
                       feats=('order_count', 'hour', 'minute', 'day_of_week'),
                       n: int = SEQ_LENGTH):
-    """Return X.shape=(samples,n,len(feats)), y.shape=(samples,)"""
+    """Convert a time‑series frame to (X, y) supervised samples."""
     X, y = [], []
     for i in range(len(df) - n):
-        X.append(df[feats].iloc[i:i+n].values)
-        y.append(df['order_count'].iloc[i+n])
+        X.append(df[feats].iloc[i:i + n].values)
+        y.append(df['order_count'].iloc[i + n])
     return np.array(X), np.array(y)
 
-# -------------------------------------------------
-def train_model(df: pd.DataFrame):
-    feats = ['order_count', 'hour', 'minute', 'day_of_week']
-    X, y = create_supervised(df, feats, SEQ_LENGTH)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # Scale inputs & target separately
-    scaler_x = MinMaxScaler()
-    X_scaled = scaler_x.fit_transform(
-        X.reshape(-1, len(feats))
-    ).reshape(X.shape)
-
-    scaler_y = MinMaxScaler()
-    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1))
-
+def build_model(input_shape):
     model = Sequential([
-        LSTM(32, activation='relu', input_shape=(SEQ_LENGTH, len(feats))),
+        Input(shape=input_shape),
+        LSTM(32, activation='relu'),
         Dense(16, activation='relu'),
         Dense(1)
     ])
     model.compile(optimizer='adam', loss='mse')
+    return model
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def train_model(df: pd.DataFrame):
+    feats = ['order_count', 'hour', 'minute', 'day_of_week']
+    X, y = create_supervised(df, feats, SEQ_LENGTH)
+
+    # Two separate scalers: inputs & target
+    sx = MinMaxScaler()
+    X_scaled = sx.fit_transform(X.reshape(-1, len(feats))).reshape(X.shape)
+
+    sy = MinMaxScaler()
+    y_scaled = sy.fit_transform(y.reshape(-1, 1))
+
+    model = build_model((SEQ_LENGTH, len(feats)))
     early = EarlyStopping(monitor='val_loss', patience=3,
                           restore_best_weights=True)
     model.fit(X_scaled, y_scaled,
               epochs=EPOCHS, batch_size=32,
               validation_split=0.2, callbacks=[early],
               verbose=0)
-    return model, scaler_x, scaler_y
+    return model, sx, sy
 
-# -------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+
 def detect_anomaly(history: pd.DataFrame,
-                   model, scaler_x, scaler_y,
+                   model, sx, sy,
                    ts: datetime, order_cnt: int):
+    """Return a dict with anomaly diagnostics or (None, err)."""
     ts_floor = pd.to_datetime(ts).floor('20min')
 
-    # Build supervised window from *past* SEQ_LENGTH intervals
+    # Past SEQ_LENGTH bins (exclude the test bin itself)
     past = history[history['interval_20min'] < ts_floor].tail(SEQ_LENGTH)
     if len(past) < SEQ_LENGTH:
-        return None, (f'Need ≥ {SEQ_LENGTH} prior intervals '
-                      f'for {ts_floor} prediction.')
+        return None, (f'Need ≥ {SEQ_LENGTH} prior intervals for {ts_floor} prediction.')
 
     feats = ['order_count', 'hour', 'minute', 'day_of_week']
-    X = past[feats].values
-    X_scaled = scaler_x.transform(X).reshape(1, SEQ_LENGTH, len(feats))
+    X  = past[feats].values
+    Xs = sx.transform(X).reshape(1, SEQ_LENGTH, len(feats))
 
-    pred_scaled = model.predict(X_scaled, verbose=0)[0, 0]
-    pred_order = scaler_y.inverse_transform([[pred_scaled]])[0, 0]
+    pred_scaled = model.predict(Xs, verbose=0)[0, 0]
+    pred_order  = sy.inverse_transform([[pred_scaled]])[0, 0]
 
     actual = order_cnt
     p_val = poisson.cdf(actual, pred_order)
-    rolling = history['order_count'].tail(12)  # exclude test point
+
+    rolling = history['order_count'].tail(12)  # 4 h window (12×20min)
     anomaly = (
         (p_val < 0.001) and
         (actual < 0.5 * pred_order) and
-        (actual < (rolling.mean() - 2 * rolling.std()))
+        (actual < rolling.mean() - 2 * rolling.std())
     )
 
     return {
@@ -109,68 +150,76 @@ def detect_anomaly(history: pd.DataFrame,
         'anomaly': anomaly
     }, None
 
-# -------------------------------------------------
-def main():
-    st.title('Order‑count anomaly detector')
+# ──────────────────────────────────────────────────────────────────────────────
 
-    file = st.file_uploader('⬆️ CSV with date, time, client_code, order_count')
+def main():
+    st.title('📉 Order‑count anomaly detector')
+
+    file = st.file_uploader('⬆️ CSV with order data')
     if file is None:
-        st.info('Waiting for a CSV…')
+        st.info('Upload a CSV to continue.')
         st.stop()
 
     df_raw = pd.read_csv(file)
-    required = {'date', 'time', 'client_code', 'order_count'}
-    if not required.issubset(df_raw.columns):
-        missing = ", ".join(required)
-        st.error(f'CSV must contain: {missing}')
+
+    if 'order_count' not in df_raw.columns:
+        st.error("CSV must contain an 'order_count' column.")
         st.stop()
+
+    # If no client_code, treat whole file as one client
+    if 'client_code' not in df_raw.columns:
+        df_raw['client_code'] = 'ALL'
 
     client = st.selectbox('Client to model',
                           sorted(df_raw['client_code'].unique()))
-    df_client = preprocess(df_raw, client)
+
+    # Pre‑processing can raise ValueError – catch & show
+    try:
+        df_client = preprocess(df_raw, client)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+
     st.write(f'Aggregated rows: **{len(df_client)}**')
 
     if len(df_client) < SEQ_LENGTH + 1:
-        st.error(f'Need ≥ {SEQ_LENGTH + 1} rows for training.')
+        st.error(f'Need ≥ {SEQ_LENGTH + 1} rows after aggregation for training.')
         st.stop()
 
-    if st.button('Train / Retrain model'):
+    if st.button('🔄 Train / Retrain model'):
         with st.spinner('Training…'):
             model, sx, sy = train_model(df_client)
-        st.session_state.update(model=model, scaler_x=sx,
-                                scaler_y=sy, history=df_client)
-        st.success('Model ready! Enter a new data point below.')
+        st.session_state.update(model=model, sx=sx, sy=sy, history=df_client)
+        st.success('Model trained! Enter a test point below.')
 
-    if {'model', 'scaler_x', 'scaler_y', 'history'} <= st.session_state.keys():
-        st.subheader('🔍 Check a new point')
+    if {'model', 'sx', 'sy', 'history'} <= st.session_state.keys():
+        st.subheader('🔍 Check a new data point')
         col1, col2 = st.columns(2)
         with col1:
             ts_str = st.text_input('Timestamp (YYYY‑MM‑DD HH:MM)',
-                                   value=datetime.now()
-                                   .strftime('%Y‑%m‑%d %H:%M'))
+                                   value=datetime.now().strftime('%Y-%m-%d %H:%M'))
         with col2:
             cnt = st.number_input('Order count', min_value=0, value=0)
 
         if st.button('Detect'):
             try:
-                ts = datetime.strptime(ts_str, '%Y‑%m‑%d %H:%M')
+                ts = pd.to_datetime(ts_str, dayfirst=False, errors='raise')
             except ValueError:
-                st.error('Invalid timestamp format.')
+                st.error('Invalid timestamp format; use YYYY‑MM‑DD HH:MM')
                 st.stop()
 
             res, err = detect_anomaly(st.session_state['history'],
                                       st.session_state['model'],
-                                      st.session_state['scaler_x'],
-                                      st.session_state['scaler_y'],
+                                      st.session_state['sx'],
+                                      st.session_state['sy'],
                                       ts, int(cnt))
             if err:
                 st.error(err)
             else:
-                st.write(f'**Predicted (expected):** {res["predicted"]:.2f}')
-                st.write(f'**P‑value:** {res["p_value"]:.4f}')
-                st.write(f'**Anomaly:** {res["anomaly"]}')
-                st.markdown('### 🚨 **Anomaly!**' if res['anomaly']
-                            else '### ✅ All good.')
+                st.write(f"**Predicted (expected):** {res['predicted']:.2f}")
+                st.write(f"**P‑value:** {res['p_value']:.4g}")
+                st.write(f"**Anomaly:** {res['anomaly']}")
+                st.markdown('### 🚨 **Anomaly!**' if res['anomaly'] else '### ✅ Normal behaviour')
     else:
         st.info('Train the model first.')
 
