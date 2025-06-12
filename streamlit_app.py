@@ -156,15 +156,13 @@ def detect_anomaly(history: pd.DataFrame,
             return None, ('No historical data for this day‑of‑week/time‑of‑day slot.')
         expected = subset['order_count'].mean()
 
-    # ── Statistical tests ─────────────────────────────────────────────────
-    p_val  = poisson.cdf(actual, max(expected, 1e-6))  # avoid μ=0
-    rolling = history['order_count'].tail(12)  # 4 h window or less if near start
+        # ── Statistical tests ─────────────────────────────────────────────────
+    p_val       = poisson.cdf(actual, max(expected, 1e-6))  # avoid μ=0
+    ratio_flag  = (actual + 1e-9) / (expected + 1e-9) < 0.5
+    poisson_flag = p_val < 0.001
 
-    anomaly = (
-        (p_val < 0.001) and
-        (actual < 0.5 * expected) and
-        (actual < rolling.mean() - 2 * rolling.std())
-    )
+    # Strict but robust: flag if the drop is both statistically rare *and* a ≥50 % fall
+    anomaly = poisson_flag and ratio_flag
 
     return {
         'timestamp': ts_floor,
