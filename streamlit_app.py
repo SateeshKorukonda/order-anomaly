@@ -117,43 +117,62 @@ def train_model(df: pd.DataFrame):
 def detect_anomaly(history: pd.DataFrame,
                    model, sx, sy,
                    ts: datetime, order_cnt: int):
-    """Return a dict with anomaly diagnostics or (None, err)."""
-    ts_floor = pd.to_datetime(ts).floor('20min')
+    """Detect anomaly for *ts/order_cnt*.
 
-    # Past SEQ_LENGTH bins (exclude the test bin itself)
-    past = history[history['interval_20min'] < ts_floor].tail(SEQ_LENGTH)
-    if len(past) < SEQ_LENGTH:
-        return None, (f'Need ≥ {SEQ_LENGTH} prior intervals for {ts_floor} prediction.')
+    Two modes:
+    1. **Sequence‑based forecast** – when *ts* is within four hours of the last
+       timestamp in *history*. Uses the LSTM forecaster trained on the most
+       recent two hours of data.
+    2. **Calendar baseline** – when *ts* lies farther in the future wrt the
+       training data. Computes the historical mean for the same day‑of‑week
+       and 20‑min slot and uses that as the expected value.
+    """
+    ts_floor = pd.to_datetime(ts).floor('20min')
+    h_max    = history['interval_20min'].max()
 
     feats = ['order_count', 'hour', 'minute', 'day_of_week']
-    X  = past[feats].values
-    Xs = sx.transform(X).reshape(1, SEQ_LENGTH, len(feats))
-
-    pred_scaled = model.predict(Xs, verbose=0)[0, 0]
-    pred_order  = sy.inverse_transform([[pred_scaled]])[0, 0]
-
     actual = order_cnt
-    p_val = poisson.cdf(actual, pred_order)
 
-    rolling = history['order_count'].tail(12)  # 4 h window (12×20min)
-    condition_1 = p_val < 0.001
-    condition_2 = actual < 0.5 * pred_order
-    condition_3 = actual < rolling.mean() - 2 * rolling.std()
+    # ── Mode choice ─────────────────────────────────────────────────────────
+    if (ts_floor - h_max) <= pd.Timedelta(hours=4):
+        # ── 1 · Sequence‑based forecast ────────────────────────────────────
+        past = history[history['interval_20min'] < ts_floor].tail(SEQ_LENGTH)
+        if len(past) < SEQ_LENGTH:
+            return None, (f'Need ≥ {SEQ_LENGTH} prior intervals for {ts_floor} prediction.')
+
+        X  = past[feats].values
+        Xs = sx.transform(X).reshape(1, SEQ_LENGTH, len(feats))
+        pred_scaled = model.predict(Xs, verbose=0)[0, 0]
+        expected    = sy.inverse_transform([[pred_scaled]])[0, 0]
+    else:
+        # ── 2 · Calendar baseline (same DOW & clock) ───────────────────────
+        cal_mask = (
+            (history['hour']   == ts_floor.hour) &
+            (history['minute'] == ts_floor.minute) &
+            (history['day_of_week'] == ts_floor.dayofweek)
+        )
+        subset = history[cal_mask]
+        if subset.empty:
+            return None, ('No historical data for this day‑of‑week/time‑of‑day slot.')
+        expected = subset['order_count'].mean()
+
+    # ── Statistical tests ─────────────────────────────────────────────────
+    p_val  = poisson.cdf(actual, max(expected, 1e-6))  # avoid μ=0
+    rolling = history['order_count'].tail(12)  # 4 h window or less if near start
+
     anomaly = (
         (p_val < 0.001) and
-        (actual < 0.5 * pred_order) and
+        (actual < 0.5 * expected) and
         (actual < rolling.mean() - 2 * rolling.std())
     )
 
     return {
         'timestamp': ts_floor,
         'actual': actual,
-        'predicted': pred_order,
+        'expected': expected,
         'p_value': p_val,
         'anomaly': anomaly,
-        'condition_1':condition_1,
-        'condition_2':condition_2,
-        'condition_3':condition_3
+        'mode': 'sequence' if (ts_floor - h_max) <= pd.Timedelta(hours=4) else 'calendar'
     }, None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,10 +244,6 @@ def main():
                 st.write(f"**Predicted (expected):** {res['predicted']:.2f}")
                 st.write(f"**P‑value:** {res['p_value']:.4g}")
                 st.write(f"**Anomaly:** {res['anomaly']}")
-                st.write(f"**condition_1:** {res['condition_1']}")
-                st.write(f"**condition_2:** {res['condition_2']}")
-                st.write(f"**condition_3:** {res['condition_3']}")
-                
                 st.markdown('### 🚨 **Anomaly!**' if res['anomaly'] else '### ✅ Normal behaviour')
     else:
         st.info('Train the model first.')
