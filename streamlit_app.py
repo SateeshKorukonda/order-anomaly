@@ -136,6 +136,9 @@ def detect_anomaly(history: pd.DataFrame,
     p_val = poisson.cdf(actual, pred_order)
 
     rolling = history['order_count'].tail(12)  # 4 h window (12×20min)
+    condition_1 = p_val < 0.001
+    condition_2 = actual < 0.5 * pred_order
+    condition_3 = actual < rolling.mean() - 2 * rolling.std()
     anomaly = (
         (p_val < 0.001) and
         (actual < 0.5 * pred_order) and
@@ -147,7 +150,10 @@ def detect_anomaly(history: pd.DataFrame,
         'actual': actual,
         'predicted': pred_order,
         'p_value': p_val,
-        'anomaly': anomaly
+        'anomaly': anomaly,
+        'condition_1':condition_1,
+        'condition_2':condition_2,
+        'condition_3':condition_3
     }, None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -219,6 +225,10 @@ def main():
                 st.write(f"**Predicted (expected):** {res['predicted']:.2f}")
                 st.write(f"**P‑value:** {res['p_value']:.4g}")
                 st.write(f"**Anomaly:** {res['anomaly']}")
+                st.write(f"**condition_1:** {res['condition_1']}")
+                st.write(f"**condition_2:** {res['condition_2']}")
+                st.write(f"**condition_3:** {res['condition_3']}")
+                
                 st.markdown('### 🚨 **Anomaly!**' if res['anomaly'] else '### ✅ Normal behaviour')
     else:
         st.info('Train the model first.')
