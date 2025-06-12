@@ -150,7 +150,7 @@ def main():
             else:
                 st.write(f'**Predicted:** {res["predicted"]:.2f}')
                 st.write(f'**P-value:** {res["p_value"]:.4f}')
-                st.write(f'** anamoly response {res['anomaly']}')
+                st.write(f'** anamoly response {res["anomaly"]}')
                 st.markdown('### 🚨 **Anomaly!**' if res['anomaly']
                             else '### ✅ All good.')
 
